@@ -33,6 +33,7 @@ local MAX_EXACT_INTEGER = 2 ^ 53 - 1
 
 local economyStates: { [Player]: EconomyState } = {}
 local initialized = false
+local warnedNotInitialized = false
 
 local EconomyService = {}
 
@@ -54,6 +55,28 @@ end
 -- Prices may be zero ("free"), but never negative.
 local function isValidPrice(value: any): boolean
 	return isWholeNumber(value) and value >= 0
+end
+
+-- Looks up a player's authoritative state. Every public function goes through here so that
+-- calling this module copy before Initialize() is reported instead of failing silently.
+-- Each copy of the module (e.g. one required separately by the Studio Command Bar) has its own
+-- private state, so a copy that never ran Initialize() can only ever see "no state".
+local function getState(player: Player, caller: string): EconomyState?
+	if not initialized then
+		if not warnedNotInitialized then
+			warnedNotInitialized = true
+			warn(
+				"[EconomyService] "
+					.. caller
+					.. " was called on a module copy where Initialize() never ran; it has no player "
+					.. "state. Use the instance initialized by Main.server.luau (e.g. call it from a "
+					.. "Script running under ServerScriptService, not the Command Bar)."
+			)
+		end
+		return nil
+	end
+
+	return economyStates[player]
 end
 
 local function findOrCreateLeaderstats(player: Player): Folder
@@ -192,7 +215,7 @@ end
 -- removed, or not a Player at all) read as 0; mutating functions return false for them, so
 -- callers can never create Cash by accident.
 function EconomyService.GetCash(player: Player): number
-	local state = economyStates[player]
+	local state = getState(player, "GetCash")
 	if state == nil then
 		return 0
 	end
@@ -210,7 +233,7 @@ function EconomyService.AddCash(player: Player, amount: number): boolean
 		return false
 	end
 
-	local state = economyStates[player]
+	local state = getState(player, "AddCash")
 	if state == nil then
 		return false
 	end
@@ -234,7 +257,7 @@ function EconomyService.CanAfford(player: Player, price: number): boolean
 		return false
 	end
 
-	local state = economyStates[player]
+	local state = getState(player, "CanAfford")
 	if state == nil then
 		return false
 	end
@@ -252,7 +275,7 @@ function EconomyService.SpendCash(player: Player, amount: number): boolean
 		return false
 	end
 
-	local state = economyStates[player]
+	local state = getState(player, "SpendCash")
 	if state == nil then
 		return false
 	end
