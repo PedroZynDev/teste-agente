@@ -8,10 +8,10 @@ return table.freeze({
 	-- (9,007,199,254,740,991), the largest range where Luau numbers (doubles) and
 	-- JSON/DataStore values stay exact integers.
 	--
-	-- 1e15 (one quadrillion) is far beyond any planned normal progression, yet still ~9x
-	-- below that limit, which leaves headroom for future multipliers and persistence.
-	-- It also fits comfortably in an IntValue (leaderstats).
+	-- 1_000_000_000_000 (one trillion) is far beyond any planned normal progression, yet
+	-- ~9000x below that limit, which leaves ample headroom for future multipliers and
+	-- persistence. It also fits comfortably in an IntValue (leaderstats).
 	--
 	-- AddCash saturates at this value instead of overflowing or failing.
-	MaxCash = 1e15,
+	MaxCash = 1_000_000_000_000,
 })
