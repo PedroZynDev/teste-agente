@@ -27,6 +27,46 @@ local initialized = false
 
 local PlotService = {}
 
+-- === Plot lifecycle notifications (extension added for MiningService) ===
+-- MiningService must know exactly when a plot becomes owned or is freed, without polling.
+-- These are server-side-only listener lists: no RemoteEvents/RemoteFunctions are created
+-- and no client can subscribe. Handlers are called synchronously inside the claim/release
+-- paths, so (like the rest of the claim path) they must not yield; each handler runs under
+-- pcall so a broken handler can never roll back or wedge claim/release itself.
+-- Public API below: PlotService.OnPlotClaimed(cb) / PlotService.OnPlotReleased(cb).
+type PlotLifecycleListener = (player: Player, plot: Model) -> ()
+
+local nextPlotHandlerId = 0
+local plotClaimedHandlers: { [number]: PlotLifecycleListener } = {}
+local plotReleasedHandlers: { [number]: PlotLifecycleListener } = {}
+
+local function registerPlotLifecycleHandler(
+	handlers: { [number]: PlotLifecycleListener },
+	callback: PlotLifecycleListener
+): () -> ()
+	nextPlotHandlerId += 1
+	local handlerId = nextPlotHandlerId
+	handlers[handlerId] = callback
+	return function()
+		handlers[handlerId] = nil
+	end
+end
+
+local function emitPlotLifecycle(
+	handlers: { [number]: PlotLifecycleListener },
+	player: Player,
+	plot: Model
+)
+	-- Iterate a copy so a handler may safely disconnect itself (or another) while notified.
+	for _, listener in table.clone(handlers) do
+		local ok, err = pcall(listener, player, plot)
+		if not ok then
+			warn(("[PlotService] A plot lifecycle handler raised an error for plot %s: %s")
+				:format(plot.Name, tostring(err)))
+		end
+	end
+end
+
 local function updatePlotVisuals(state: PlotState)
 	local owner = state.Owner
 	if owner == nil then
@@ -72,6 +112,8 @@ local function releasePlayerPlot(player: Player)
 	playerPlots[player] = nil
 	plot:SetAttribute("OwnerUserId", 0)
 	updatePlotVisuals(state)
+
+	emitPlotLifecycle(plotReleasedHandlers, player, plot)
 end
 
 local function handleClaimTouch(plot: Model, touchedPart: BasePart)
@@ -107,6 +149,10 @@ local function handleClaimTouch(plot: Model, touchedPart: BasePart)
 	playerPlots[player] = plot
 	plot:SetAttribute("OwnerUserId", player.UserId)
 	updatePlotVisuals(state)
+
+	-- The claim is already authoritative here; handlers (e.g. MiningService installing a
+	-- setup) must not yield and their errors are reported without rolling the claim back.
+	emitPlotLifecycle(plotClaimedHandlers, player, plot)
 
 	state.ClaimLocked = false
 	playerClaimLocks[player] = nil
@@ -287,6 +333,18 @@ end
 function PlotService.IsPlotAvailable(plot: Model): boolean
 	local state = plotStates[plot]
 	return state ~= nil and state.Owner == nil and not state.ClaimLocked
+end
+
+-- Subscribes a server-side handler called right after a player claims a plot (claim touch
+-- fully resolved) and right after a plot is released (owner left). Both return a function
+-- that disconnects the handler. Server-only: these are NOT remotes and clients cannot
+-- subscribe or trigger them. See the lifecycle note at the top of this module.
+function PlotService.OnPlotClaimed(callback: PlotLifecycleListener): () -> ()
+	return registerPlotLifecycleHandler(plotClaimedHandlers, callback)
+end
+
+function PlotService.OnPlotReleased(callback: PlotLifecycleListener): () -> ()
+	return registerPlotLifecycleHandler(plotReleasedHandlers, callback)
 end
 
 return PlotService
