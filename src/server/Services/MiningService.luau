@@ -1,9 +1,15 @@
 --!strict
 
--- MiningService: the first functional mining cycle.
+-- MiningService: the mining production cycle.
 --
 --	Dropper -> physical Stone Part -> ConveyorSurface (belt) -> CollectorTrigger
 --	-> EconomyService.AddCash(owner, OreConfig entry Value)  =>  +$1 per stone.
+--
+-- A plot's production is modelled as "lines". One line = one full clone of the
+-- starter setup installed at its own pivot offset. Claiming installs the free
+-- starter line (index 1); the first purchase flow (PurchaseService) can add
+-- purchasable extra lines through MiningService.AddExtraDropperLine. Everything
+-- in this module is server-side only; no RemoteEvents/RemoteFunctions are created.
 --
 -- Design notes:
 --
@@ -14,11 +20,11 @@
 --     Dropper.OreSpawn, Conveyor.ConveyorSurface, Collector.CollectorTrigger
 --   Decorative geometry can change freely as long as those points exist.
 --
--- * The whole clone is placed with Model:PivotTo() using a CFrame computed from the plot
---   itself (plot ground top surface + MiningConfig.SetupPivotOffset, identity rotation).
---   Dropper/Conveyor/Collector are never moved individually and no world coordinates of
---   the original template are hardcoded. All 6 plots get the same local placement, so
---   installations can never overlap each other.
+-- * Each clone is placed with Model:PivotTo() using a CFrame computed from the plot
+--   itself (plot ground top surface + the line's offset from MiningConfig.LinePivotOffsets,
+--   identity rotation). Dropper/Conveyor/Collector are never moved individually and no
+--   world coordinates of the original template are hardcoded. All plots get the same
+--   local placement, so installations can never overlap each other.
 --
 -- * Reward authority is a server-side registry (`activeOres` below), keyed by the ore
 --   Part itself. Names and attributes on parts are debug aids only; an arbitrary or
@@ -26,7 +32,7 @@
 --   trusted for positions, ownership or values.
 --
 -- * Conveyor movement uses ONE centralized Heartbeat pass over all active ores (no per-ore
---   coroutine): while an ore is within the belt's local +Z span its horizontal velocity is
+--   coroutine): while an ore is within its line's belt span its horizontal velocity is
 --   pinned to BeltSpeed and its vertical velocity is left to physics. Movement is smooth,
 --   constant and physical; ores are never teleported to the collector. The belt direction
 --   is derived from the ConveyorSurface CFrame, so a future rotated setup still works.
@@ -34,10 +40,10 @@
 -- * Ores stay server-owned (SetNetworkOwner(nil)) so nearby clients cannot simulate or
 --   influence them.
 --
--- Deliberately out of scope for this phase: purchases, upgrades, buttons, multiple ores,
--- levels, DataStore/persistence, rebirth, Rubis, shop, UI, and any RemoteEvent/
+-- Deliberately out of scope for this phase: upgrade levels, multiple ore types, buttons
+-- and screen UI, levels, DataStore/persistence, rebirth, Rubis, shop, and any RemoteEvent/
 -- RemoteFunction. The StarterMiningSetup appears automatically after claim only to
--- validate the core loop.
+-- validate the core loop; only the extra-line capacity for the first purchase is exposed.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -79,19 +85,12 @@ type OreDefinition = {
 	Material: Enum.Material,
 }
 
--- Per-plot install. Every reference below belongs to this plot only; releasing the plot
--- tears the whole state down and never touches another plot's state.
-type PlotSetup = {
-	Plot: Model,
-	Owner: Player,
+-- One installed clone of the template (one conveyor flow with its own collector).
+type MiningLine = {
 	Setup: Model,
 	SpawnPoint: BasePart,
 	Collector: BasePart,
-	OresFolder: Folder,
 	CollectorConnection: RBXScriptConnection?,
-	ActiveOres: { [BasePart]: boolean },
-	ActiveOreCount: number,
-	Active: boolean,
 	-- Belt geometry cached in world space right after PivotTo: unit direction (derived
 	-- from ConveyorSurface, NOT assumed to be world +Z), the drop point as origin and
 	-- how far along the direction ores are still pushed.
@@ -101,26 +100,40 @@ type PlotSetup = {
 	BeltLimit: number,
 }
 
+-- Per-plot state shared by all lines of that plot. Releasing the plot tears the whole
+-- state down and never touches another plot's state.
+type PlotMiningState = {
+	Plot: Model,
+	Owner: Player,
+	Lines: { MiningLine },
+	OresFolder: Folder,
+	-- Authoritative per-plot ore bookkeeping (cap + cleanup), shared across lines:
+	ActiveOres: { [BasePart]: boolean },
+	ActiveOreCount: number,
+	Active: boolean,
+}
+
 -- Authoritative record of every ore this service created, keyed by the Part itself.
 -- An instance that is not in this table does not exist for the economy.
 type OreRegistration = {
 	OreId: string,
 	Plot: Model,
-	PlotState: PlotSetup,
+	State: PlotMiningState,
+	Line: MiningLine,
 	Owner: Player,
 	Collected: boolean,
 	SpawnedAt: number,
 }
 
 local oreConfigsById: { [string]: OreDefinition } = {}
-local setupsByPlot: { [Model]: PlotSetup } = {}
+local setupsByPlot: { [Model]: PlotMiningState } = {}
 local activeOres: { [BasePart]: OreRegistration } = {}
 
 local initialized = false
 local enabled = false
 local template: Model? = nil
 local dropOreDefinition: OreDefinition? = nil
-local activeSetupCount = 0
+local activePlotCount = 0
 local heartbeatConnection: RBXScriptConnection? = nil
 
 local MiningService = {}
@@ -163,7 +176,7 @@ local function unregisterOre(part: BasePart)
 		return
 	end
 	activeOres[part] = nil
-	local state = info.PlotState
+	local state = info.State
 	if state.ActiveOres[part] ~= nil then
 		state.ActiveOres[part] = nil
 		state.ActiveOreCount -= 1
@@ -182,7 +195,7 @@ end
 -- A single Heartbeat drives all ores in all plots, instead of one coroutine per ore.
 -- The pass is O(number of live ores) (capped at MaxActiveOresPerPlot per plot), reads
 -- only cached geometry, and never queries the setup hierarchy, so it stays cheap with
--- 6 plots producing simultaneously.
+-- several plots running multiple lines simultaneously.
 local function onHeartbeat()
 	local now = os.clock()
 	local lifetime = MiningConfig.OreLifetime
@@ -191,13 +204,13 @@ local function onHeartbeat()
 			-- Uncollected ore: remove from registry, destroy the part, free the slot.
 			destroyOre(part)
 		else
-			local state = info.PlotState
-			local along = (part.Position - state.BeltOrigin):Dot(state.BeltDirection)
-			if along <= state.BeltLimit then
+			local line = info.Line
+			local along = (part.Position - line.BeltOrigin):Dot(line.BeltDirection)
+			if along <= line.BeltLimit then
 				-- Pin horizontal velocity to the belt speed and preserve vertical velocity
 				-- so physics still owns falling/bouncing. Constant, visible movement with
 				-- no teleporting; server-owned parts, so clients only receive results.
-				local beltVelocity = state.BeltVelocity
+				local beltVelocity = line.BeltVelocity
 				part.AssemblyLinearVelocity = Vector3.new(
 					beltVelocity.X,
 					part.AssemblyLinearVelocity.Y,
@@ -211,9 +224,9 @@ end
 -- Only run the conveyor pass while at least one plot is producing; idle servers pay
 -- nothing for it.
 local function updateConveyorLoop()
-	if activeSetupCount > 0 and heartbeatConnection == nil then
+	if activePlotCount > 0 and heartbeatConnection == nil then
 		heartbeatConnection = RunService.Heartbeat:Connect(onHeartbeat)
-	elseif activeSetupCount == 0 and heartbeatConnection ~= nil then
+	elseif activePlotCount == 0 and heartbeatConnection ~= nil then
 		heartbeatConnection:Disconnect()
 		heartbeatConnection = nil
 	end
@@ -224,7 +237,7 @@ end
 -- The only place ore is converted into Cash. Everything here is synchronous (the Touched
 -- handler never yields), which is what makes the claim atomic: once Collected is set, no
 -- second callback can pay for the same ore, and EconomyService.AddCash does not yield.
-local function handleCollectorTouched(state: PlotSetup, touchedPart: BasePart)
+local function handleCollectorTouched(state: PlotMiningState, touchedPart: BasePart)
 	if not state.Active then
 		return
 	end
@@ -235,9 +248,10 @@ local function handleCollectorTouched(state: PlotSetup, touchedPart: BasePart)
 	if info == nil or info.Collected then
 		return
 	end
-	-- (4) A collector may only consume ores registered to its own plot; an ore from
-	-- another plot touching this trigger is ignored (its own collector handles it).
-	if info.PlotState ~= state or info.Plot ~= state.Plot then
+	-- (4) A collector may only consume ores registered to its own plot (any line of it;
+	-- the owner is identical across lines). An ore from another plot is ignored and the
+	-- foreign ore stays alive for its own collector.
+	if info.Plot ~= state.Plot or info.State ~= state then
 		return
 	end
 	-- (5) The plot must still belong to the expected player (owner still present and
@@ -272,7 +286,7 @@ end
 
 -- Server-created physical ore. Deliberately no Cash on spawn: money exists only after the
 -- ore is collected by the registered collector flow.
-local function spawnOre(state: PlotSetup)
+local function spawnOre(state: PlotMiningState, line: MiningLine)
 	if state.ActiveOreCount >= MiningConfig.MaxActiveOresPerPlot then
 		return
 	end
@@ -296,7 +310,7 @@ local function spawnOre(state: PlotSetup)
 	part.CanQuery = false
 	-- Drop straight from the OreSpawn integration point with a small clearance, never a
 	-- hardcoded offset relative to the model.
-	part.CFrame = state.SpawnPoint.CFrame + Vector3.new(0, MiningConfig.DropClearance, 0)
+	part.CFrame = line.SpawnPoint.CFrame + Vector3.new(0, MiningConfig.DropClearance, 0)
 	-- Debug/inspection aids ONLY. They are never read back as proof of legitimacy; the
 	-- authoritative source is the activeOres registry below.
 	part:SetAttribute("OreId", definition.Id)
@@ -316,7 +330,8 @@ local function spawnOre(state: PlotSetup)
 	activeOres[part] = {
 		OreId = definition.Id,
 		Plot = state.Plot,
-		PlotState = state,
+		State = state,
+		Line = line,
 		Owner = state.Owner,
 		Collected = false,
 		SpawnedAt = os.clock(),
@@ -325,19 +340,24 @@ local function spawnOre(state: PlotSetup)
 	state.ActiveOreCount += 1
 end
 
--- One lightweight loop per occupied plot (spawn + task.wait). It ends via state.Active on
--- release; it is not an ownership poll: the plot lifecycle itself is event-driven.
-local function runDropLoop(state: PlotSetup)
+-- One lightweight loop per line (spawn + task.wait). Loops end via state.Active on
+-- release; they are not an ownership poll: the plot lifecycle itself is event-driven.
+-- The per-plot ore cap is shared, so with several lines the total production stops at the
+-- cap and resumes automatically as slots free up.
+local function runDropLoop(state: PlotMiningState, line: MiningLine)
 	while state.Active do
-		-- Cap checked against the authoritative counter: a full tick is skipped (no warn
-		-- spam) and production resumes automatically as soon as slots free up.
 		if state.ActiveOreCount < MiningConfig.MaxActiveOresPerPlot then
-			local ok, err = pcall(spawnOre, state)
+			local ok, err = pcall(spawnOre, state, line)
 			if not ok then
-				state.Active = false
-				warn(("[MiningService] Stopping ore production on plot %s after a spawn error: %s")
+				-- Stop this line only; other lines and plots keep running.
+				local connection = line.CollectorConnection
+				if connection ~= nil then
+					connection:Disconnect()
+					line.CollectorConnection = nil
+				end
+				warn(("[MiningService] Stopping one production line on plot %s after a spawn error: %s")
 					:format(state.Plot.Name, tostring(err)))
-				break
+				return
 			end
 		end
 		task.wait(MiningConfig.DropInterval)
@@ -346,11 +366,12 @@ end
 
 -- === Placement ===
 
--- Target pivot for the setup, computed from the plot itself (never from the template's
+-- Target pivot for a line, computed from the plot itself (never from the template's
 -- original world position). The template's pivot sits on the plot's ground top surface,
--- shifted by the configured LOCAL offset, rotation left identity so every plot shows the
--- machinery facing the same way with its local +Z flow pointing away from the claim pad.
-local function computeSetupPivotCFrame(plot: Model): CFrame
+-- shifted by the line's configured LOCAL offset, rotation left identity so every plot
+-- shows the machinery facing the same way with its local +Z flow pointing away from the
+-- claim pad.
+local function computeSetupPivotCFrame(plot: Model, pivotOffset: Vector3): CFrame
 	local ground = plot:FindFirstChild(GROUND_PART_NAME)
 	local surfaceCFrame
 	if ground ~= nil and ground:IsA("BasePart") then
@@ -360,7 +381,7 @@ local function computeSetupPivotCFrame(plot: Model): CFrame
 		-- is still a plot-relative anchor and placement remains consistent for every plot.
 		surfaceCFrame = plot:GetPivot()
 	end
-	return surfaceCFrame * CFrame.new(MiningConfig.SetupPivotOffset)
+	return surfaceCFrame * CFrame.new(pivotOffset)
 end
 
 -- The ore flow runs along the template's local +Z. Derive a horizontal direction from the
@@ -377,37 +398,31 @@ local function resolveBeltDirection(setup: Model, belt: BasePart): Vector3
 	return Vector3.new(0, 0, 1)
 end
 
--- === Plot lifecycle ===
-
-local function onPlotClaimed(player: Player, plot: Model)
-	if not enabled then
-		return
-	end
-	if setupsByPlot[plot] ~= nil then
-		-- Double claim for the same plot should be impossible (PlotService owns the locks);
-		-- never install twice if the invariant ever breaks.
-		return
-	end
+-- Clones the template for line `lineIndex`, validates the integration points, places the
+-- whole model with one PivotTo(), connects its collector and starts its drop loop.
+-- Returns the line, or nil after a loud warning (never a substitute model, never money).
+local function installLine(state: PlotMiningState, lineIndex: number): MiningLine?
 	local templateModel = template
-	if templateModel == nil then
-		return
+	local pivotOffset = MiningConfig.LinePivotOffsets[lineIndex]
+	if templateModel == nil or pivotOffset == nil or not state.Active then
+		return nil
 	end
 
 	-- Clone the Studio-authored model as a whole; nothing here rebuilds its ~212 parts.
 	local setup = templateModel:Clone()
-	setup.Name = MINING_SETUP_NAME
+	setup.Name = MINING_SETUP_NAME .. (if lineIndex > 1 then tostring(lineIndex) else "")
 
-	local clonePath = ("Workspace.%s.%s"):format(plot.Name, MINING_SETUP_NAME)
+	local clonePath = ("Workspace.%s.%s"):format(state.Plot.Name, setup.Name)
 	local spawnPoint: BasePart? = nil
 	local belt: BasePart? = nil
 	local collector: BasePart? = nil
 	for _, integrationPoint in INTEGRATION_POINTS do
 		local part = findIntegrationPoint(setup, integrationPoint.Container, integrationPoint.Point)
 		if part == nil then
-			warn(("[MiningService] Not installing mining on plot %s: the clone of %s is missing %s. Fix the asset; no substitute setup is generated and no ore will be produced.")
-				:format(plot.Name, TEMPLATE_PATH, describeIntegrationPoint(clonePath, integrationPoint.Container, integrationPoint.Point)))
+			warn(("[MiningService] Not installing mining line %d on plot %s: the clone of %s is missing %s. Fix the asset; no substitute setup is generated and no ore will be produced.")
+				:format(lineIndex, state.Plot.Name, TEMPLATE_PATH, describeIntegrationPoint(clonePath, integrationPoint.Container, integrationPoint.Point)))
 			setup:Destroy()
-			return
+			return nil
 		end
 		if integrationPoint.Point == "OreSpawn" then
 			spawnPoint = part
@@ -421,72 +436,59 @@ local function onPlotClaimed(player: Player, plot: Model)
 	-- All three points were validated above; this only narrows optionality for the reader.
 	if spawnPoint == nil or belt == nil or collector == nil then
 		setup:Destroy()
-		return
+		return nil
 	end
 
 	-- Move the ENTIRE set once with its pivot. Dropper, Conveyor and Collector are only
 	-- referenced (never repositioned); their relative geometry belongs to the asset.
-	setup:PivotTo(computeSetupPivotCFrame(plot))
+	setup:PivotTo(computeSetupPivotCFrame(state.Plot, pivotOffset))
 
 	local direction = resolveBeltDirection(setup, belt)
 	local beltOrigin = spawnPoint.Position
 	-- Distance from the drop point to the collector, measured along the belt's derived
 	-- forward axis. If the collector is not downstream, the asset is misconfigured (e.g.
-	-- wrong pivot/orientation) and production for this plot is refused loudly.
+	-- wrong pivot/orientation) and this line is refused loudly.
 	local collectorAhead = (collector.Position - beltOrigin):Dot(direction)
 	if collectorAhead <= 0.5 then
-		warn(("[MiningService] Not installing mining on plot %s: CollectorTrigger is not downstream along ConveyorSurface's local +Z (measured %.2f studs). Check the template's pivot/orientation.")
-			:format(plot.Name, collectorAhead))
+		warn(("[MiningService] Not installing mining line %d on plot %s: CollectorTrigger is not downstream along ConveyorSurface's local +Z (measured %.2f studs). Check the template's pivot/orientation.")
+			:format(lineIndex, state.Plot.Name, collectorAhead))
 		setup:Destroy()
-		return
+		return nil
 	end
 
-	local oresFolder = Instance.new("Folder")
-	oresFolder.Name = ORES_FOLDER_NAME
-	oresFolder.Parent = plot
-	setup.Parent = plot
+	setup.Parent = state.Plot
 
-	local state: PlotSetup = {
-		Plot = plot,
-		Owner = player,
+	local line: MiningLine = {
 		Setup = setup,
 		SpawnPoint = spawnPoint,
 		Collector = collector,
-		OresFolder = oresFolder,
 		CollectorConnection = nil,
-		ActiveOres = {},
-		ActiveOreCount = 0,
-		Active = true,
 		BeltDirection = direction,
 		BeltVelocity = direction * MiningConfig.BeltSpeed,
 		BeltOrigin = beltOrigin,
 		BeltLimit = collectorAhead + MiningConfig.BeltOvershoot,
 	}
-	setupsByPlot[plot] = state
-	activeSetupCount += 1
-	updateConveyorLoop()
+	table.insert(state.Lines, line)
 
-	state.CollectorConnection = collector.Touched:Connect(function(touchedPart: BasePart)
+	line.CollectorConnection = collector.Touched:Connect(function(touchedPart: BasePart)
 		handleCollectorTouched(state, touchedPart)
 	end)
 
-	-- Claimed -> start producing Stone for this plot (first drop is immediate).
-	task.spawn(runDropLoop, state)
+	task.spawn(runDropLoop, state, line)
+	return line
 end
 
-local function onPlotReleased(_player: Player, plot: Model)
-	local state = setupsByPlot[plot]
-	if state == nil then
-		return
-	end
-	-- Idempotent teardown; only affects this plot's state.
-	setupsByPlot[plot] = nil
+-- Full teardown of one plot's mining: idempotent, only affects this plot.
+local function teardownPlotState(state: PlotMiningState)
+	setupsByPlot[state.Plot] = nil
 	state.Active = false
 
-	local connection = state.CollectorConnection
-	if connection ~= nil then
-		connection:Disconnect()
-		state.CollectorConnection = nil
+	for _, line in state.Lines do
+		local connection = line.CollectorConnection
+		if connection ~= nil then
+			connection:Disconnect()
+			line.CollectorConnection = nil
+		end
 	end
 
 	-- Drop every still-active ore of this plot from the shared registry first (so a late
@@ -496,10 +498,86 @@ local function onPlotReleased(_player: Player, plot: Model)
 	end
 	state.ActiveOres = {}
 	state.OresFolder:Destroy()
-	state.Setup:Destroy()
+	for _, line in state.Lines do
+		line.Setup:Destroy()
+	end
+	state.Lines = {}
 
-	activeSetupCount -= 1
+	activePlotCount -= 1
 	updateConveyorLoop()
+end
+
+-- === Plot lifecycle ===
+
+local function onPlotClaimed(player: Player, plot: Model)
+	if not enabled or setupsByPlot[plot] ~= nil then
+		-- A second claim for an already-mining plot must never double-install.
+		return
+	end
+
+	local oresFolder = Instance.new("Folder")
+	oresFolder.Name = ORES_FOLDER_NAME
+	oresFolder.Parent = plot
+
+	local state: PlotMiningState = {
+		Plot = plot,
+		Owner = player,
+		Lines = {},
+		OresFolder = oresFolder,
+		ActiveOres = {},
+		ActiveOreCount = 0,
+		Active = true,
+	}
+	setupsByPlot[plot] = state
+	activePlotCount += 1
+	updateConveyorLoop()
+
+	-- Starter line at index 1; failure means this plot cannot mine at all.
+	local line = installLine(state, 1)
+	if line == nil then
+		teardownPlotState(state)
+	end
+end
+
+local function onPlotReleased(_player: Player, plot: Model)
+	local state = setupsByPlot[plot]
+	if state == nil then
+		return
+	end
+	teardownPlotState(state)
+end
+
+-- === Purchasable extra lines (used by PurchaseService; server-side only) ===
+
+-- Extra lines available for purchase beyond the free starter line. Zero when mining is
+-- disabled or the configuration offers only the starter offset.
+function MiningService.GetPurchasableLineCount(): number
+	if not enabled then
+		return 0
+	end
+	return math.max(0, #MiningConfig.LinePivotOffsets - 1)
+end
+
+-- Installs the next production line on a plot. Returns true only when the line was
+-- actually installed. `player` must currently own `plot`; the check makes this safe to
+-- call even if a caller's validation is ever weakened.
+function MiningService.AddExtraDropperLine(player: Player, plot: Model): boolean
+	if not enabled then
+		return false
+	end
+	local state = setupsByPlot[plot]
+	if state == nil or not state.Active then
+		return false
+	end
+	if PlotService.GetPlotOwner(plot) ~= player then
+		return false
+	end
+	local lineIndex = #state.Lines + 1
+	if lineIndex <= 1 or lineIndex > #MiningConfig.LinePivotOffsets then
+		-- Purchases start at line 2 and stop at the configured capacity.
+		return false
+	end
+	return installLine(state, lineIndex) ~= nil
 end
 
 -- === Initialization / asset + config validation ===
@@ -533,8 +611,14 @@ function MiningService.Initialize()
 	if not isFiniteNumber(MiningConfig.DropClearance) or MiningConfig.DropClearance < 0 then
 		table.insert(problems, "MiningConfig.DropClearance must be a finite number of studs >= 0")
 	end
-	if typeof(MiningConfig.SetupPivotOffset) ~= "Vector3" then
-		table.insert(problems, "MiningConfig.SetupPivotOffset must be a Vector3")
+	if typeof(MiningConfig.LinePivotOffsets) ~= "table" or #MiningConfig.LinePivotOffsets < 1 then
+		table.insert(problems, "MiningConfig.LinePivotOffsets must be a non-empty array of Vector3 offsets")
+	else
+		for index, offset in MiningConfig.LinePivotOffsets do
+			if typeof(offset) ~= "Vector3" then
+				table.insert(problems, ("MiningConfig.LinePivotOffsets[%d] must be a Vector3"):format(index))
+			end
+		end
 	end
 
 	local oreCount = 0
