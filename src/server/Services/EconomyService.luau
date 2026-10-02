@@ -3,10 +3,14 @@
 -- EconomyService is the single authority for a player's Cash.
 --
 -- * Cash lives only in the server-side table below. Nothing else (including the leaderstats
---   IntValue) is ever read back as a balance.
+--   IntValue) is ever read back as a balance, with one narrow exception: SnapshotCash
+--   (used only by DataService on exit) may read the display mirror AFTER the authoritative
+--   state is already gone, because the mirror is only ever written by this module.
 -- * Cash is always a whole number in the range [0, EconomyConfig.MaxCash].
--- * There is no persistence yet: balances start at StartingCash every session and are
---   discarded when the player leaves.
+-- * Persistence is not this module's job: balances still start at StartingCash and are
+--   discarded when the player leaves. DataService (basic persistence) layers save/load on
+--   top through the two functions at the bottom of this module (RestoreCash,
+--   SnapshotCash); it never reads or mutates anything else here.
 -- * This module creates no Remotes. Cash can only change through the functions below, called
 --   by other server code.
 --
@@ -286,6 +290,62 @@ function EconomyService.SpendCash(player: Player, amount: number): boolean
 
 	setCash(player, state, state.Cash - amount)
 	return true
+end
+
+-- === Extensions added for DataService (basic persistence) ===
+
+-- Applies a balance loaded from the DataStore on top of the current balance. This is
+-- deliberately ADDITIVE (delegates to AddCash): a player can earn legitimately before
+-- the async load resolves, and restoring must neither overwrite that income nor double
+-- anything (StartingCash is 0, so saved + earned is the correct total). Returns false
+-- (nothing changed) when the amount is invalid or the player has no economy state; in
+-- the "no state" case (player already left), DataService keeps the value pending and
+-- adds it to the exit-save snapshot instead.
+function EconomyService.RestoreCash(player: Player, amount: number): boolean
+	if not isValidAmount(amount) then
+		return false
+	end
+
+	return EconomyService.AddCash(player, amount)
+end
+
+-- Read-only balance snapshot that survives the exit race: DataService saves during
+-- PlayerRemoving, but EconomyService's own PlayerRemoving handler (connected first) may
+-- already have dropped the state. The leaderstats IntValue is a one-way mirror that
+-- syncLeaderstats keeps equal to the authoritative value on every change, and nothing
+-- reads back from it, so the mirror's last synced value is exactly the last balance.
+-- Prefers the live state when present; falls back to the mirror; returns 0 when neither
+-- can be found. This function never mutates anything and stays bounded by [0, MaxCash].
+function EconomyService.SnapshotCash(player: Player): number
+	local state = economyStates[player]
+	if state ~= nil then
+		return state.Cash
+	end
+
+	if not initialized then
+		return 0
+	end
+
+	local leaderstats = player:FindFirstChild(LEADERSTATS_NAME)
+	if leaderstats ~= nil and leaderstats:IsA("Folder") then
+		local cashValue = leaderstats:FindFirstChild(CASH_VALUE_NAME)
+		if cashValue ~= nil and cashValue:IsA("IntValue") and isWholeNumber(cashValue.Value) then
+			-- The mirror is display state, but it is only ever written by this module
+			-- (or reset back to state.Cash when touched from outside), so reading it as a
+			-- fallback AFTER the authoritative state is gone is safe. Clamp defensively:
+			-- a rogue value must never enter persisted data.
+			local value = cashValue.Value
+			local maxCash = EconomyConfig.MaxCash
+			if value < 0 then
+				return 0
+			elseif value > maxCash then
+				return maxCash
+			end
+			return value
+		end
+	end
+
+	return 0
 end
 
 return EconomyService

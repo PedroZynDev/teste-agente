@@ -12,6 +12,8 @@ local miningServiceModule = servicesFolder:WaitForChild("MiningService") :: Modu
 local MiningService = require(miningServiceModule)
 local purchaseServiceModule = servicesFolder:WaitForChild("PurchaseService") :: ModuleScript
 local PurchaseService = require(purchaseServiceModule)
+local dataServiceModule = servicesFolder:WaitForChild("DataService") :: ModuleScript
+local DataService = require(dataServiceModule)
 
 PlotService.Initialize()
 EconomyService.Initialize()
@@ -30,3 +32,10 @@ MiningService.Initialize()
 -- time any pad exists, mining validation has already run (if mining is disabled, this
 -- line is never reached and no pads are created).
 PurchaseService.Initialize()
+
+-- DataService is the only DataStore caller and wraps the whole flow: it needs
+-- EconomyService initialized first (restore applies once the player has economy state;
+-- the exit save reads EconomyService.SnapshotCash), and it must come after every service
+-- that produces or spends Cash so nothing can earn against an un-restored balance.
+-- A store outage degrades to "no persistence" with warnings; the game keeps running.
+DataService.Initialize()
