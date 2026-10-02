@@ -16,16 +16,51 @@ type PlotState = {
 	ClaimLocked: boolean,
 }
 
+type PlotLifecycleListener = {
+	OnPlotClaimed: (plot: Model, owner: Player) -> (),
+	OnPlotReleased: (plot: Model, previousOwner: Player) -> (),
+}
+
 local PLOTS_FOLDER_NAME = "TycoonPlots"
 local PLOT_NAME_PREFIX = "Plot"
 
 local plotStates: { [Model]: PlotState } = {}
+local createdPlots: { Model } = {}
+local lifecycleListeners: { PlotLifecycleListener } = {}
 local playerPlots: { [Player]: Model } = {}
 local playerClaimLocks: { [Player]: boolean } = {}
 local playersLeaving = setmetatable({}, { __mode = "k" }) :: { [Player]: boolean }
 local initialized = false
 
 local PlotService = {}
+
+local function notifyPlotClaimed(plot: Model, owner: Player)
+	for _, listener in lifecycleListeners do
+		local succeeded, errorMessage = pcall(listener.OnPlotClaimed, plot, owner)
+		if not succeeded then
+			warn(
+				("[PlotService] OnPlotClaimed listener failed for %s: %s"):format(
+					plot.Name,
+					tostring(errorMessage)
+				)
+			)
+		end
+	end
+end
+
+local function notifyPlotReleased(plot: Model, previousOwner: Player)
+	for _, listener in lifecycleListeners do
+		local succeeded, errorMessage = pcall(listener.OnPlotReleased, plot, previousOwner)
+		if not succeeded then
+			warn(
+				("[PlotService] OnPlotReleased listener failed for %s: %s"):format(
+					plot.Name,
+					tostring(errorMessage)
+				)
+			)
+		end
+	end
+end
 
 local function updatePlotVisuals(state: PlotState)
 	local owner = state.Owner
@@ -72,6 +107,8 @@ local function releasePlayerPlot(player: Player)
 	playerPlots[player] = nil
 	plot:SetAttribute("OwnerUserId", 0)
 	updatePlotVisuals(state)
+	-- Clear authoritative ownership before observers stop production or destroy pending ores.
+	notifyPlotReleased(plot, player)
 end
 
 local function handleClaimTouch(plot: Model, touchedPart: BasePart)
@@ -110,6 +147,7 @@ local function handleClaimTouch(plot: Model, touchedPart: BasePart)
 
 	state.ClaimLocked = false
 	playerClaimLocks[player] = nil
+	notifyPlotClaimed(plot, player)
 end
 
 local function createClaimLabel(platform: Part): TextLabel
@@ -144,7 +182,7 @@ local function createPlot(
 	columns: number,
 	gridWidth: number,
 	gridDepth: number
-)
+): Model
 	local row = math.floor((index - 1) / columns)
 	local column = (index - 1) % columns
 	local offsetX = -gridWidth / 2
@@ -213,6 +251,7 @@ local function createPlot(
 
 	-- Parent only after the state and touch handler are ready, so no early touch is lost.
 	plot.Parent = plotsFolder
+	return plot
 end
 
 local function createPlotsFolder(): Folder
@@ -259,7 +298,10 @@ function PlotService.Initialize()
 
 	local plotsFolder = createPlotsFolder()
 	for index = 1, plotCount do
-		createPlot(index, plotsFolder, baseplate, columns, gridWidth, gridDepth)
+		table.insert(
+			createdPlots,
+			createPlot(index, plotsFolder, baseplate, columns, gridWidth, gridDepth)
+		)
 	end
 
 	Players.PlayerRemoving:Connect(function(player: Player)
@@ -269,6 +311,37 @@ function PlotService.Initialize()
 	end)
 
 	initialized = true
+end
+
+function PlotService.GetPlots(): { Model }
+	return table.clone(createdPlots)
+end
+
+-- Lifecycle listeners run synchronously after PlotService has committed the ownership change.
+-- They must not yield; a failure is reported without undoing a successful plot claim/release.
+function PlotService.RegisterLifecycleListener(listener: PlotLifecycleListener)
+	table.insert(lifecycleListeners, listener)
+
+	if not initialized then
+		return
+	end
+
+	-- Registration can happen after initialization, so replay currently occupied plots once.
+	for _, plot in createdPlots do
+		local state = plotStates[plot]
+		local owner = if state ~= nil then state.Owner else nil
+		if owner ~= nil then
+			local succeeded, errorMessage = pcall(listener.OnPlotClaimed, plot, owner)
+			if not succeeded then
+				warn(
+					("[PlotService] OnPlotClaimed listener failed while registering for %s: %s"):format(
+						plot.Name,
+						tostring(errorMessage)
+					)
+				)
+			end
+		end
+	end
 end
 
 function PlotService.GetPlotForPlayer(player: Player): Model?
