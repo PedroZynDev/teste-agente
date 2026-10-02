@@ -16,6 +16,11 @@ type PlotState = {
 	ClaimLocked: boolean,
 }
 
+-- Notified after a plot changed hands, so other server services can react instead of polling
+-- for ownership. Server-side only: these are plain Luau callbacks and never a Remote.
+type PlotClaimedListener = (plot: Model, player: Player) -> ()
+type PlotReleasedListener = (plot: Model, player: Player) -> ()
+
 local PLOTS_FOLDER_NAME = "TycoonPlots"
 local PLOT_NAME_PREFIX = "Plot"
 
@@ -25,7 +30,30 @@ local playerClaimLocks: { [Player]: boolean } = {}
 local playersLeaving = setmetatable({}, { __mode = "k" }) :: { [Player]: boolean }
 local initialized = false
 
+local plotClaimedListeners: { PlotClaimedListener } = {}
+local plotReleasedListeners: { PlotReleasedListener } = {}
+
 local PlotService = {}
+
+-- Notifies subscribers and isolates their errors: one broken listener must not stop the
+-- others and, more importantly, must not leave a plot half claimed or half released.
+local function firePlotClaimed(plot: Model, player: Player)
+	for _, listener in plotClaimedListeners do
+		local ok, callbackError = pcall(listener, plot, player)
+		if not ok then
+			warn("[PlotService] A PlotClaimed listener errored: " .. tostring(callbackError))
+		end
+	end
+end
+
+local function firePlotReleased(plot: Model, player: Player)
+	for _, listener in plotReleasedListeners do
+		local ok, callbackError = pcall(listener, plot, player)
+		if not ok then
+			warn("[PlotService] A PlotReleased listener errored: " .. tostring(callbackError))
+		end
+	end
+end
 
 local function updatePlotVisuals(state: PlotState)
 	local owner = state.Owner
@@ -72,6 +100,10 @@ local function releasePlayerPlot(player: Player)
 	playerPlots[player] = nil
 	plot:SetAttribute("OwnerUserId", 0)
 	updatePlotVisuals(state)
+
+	-- The plot is fully released before listeners run, so a listener that asks
+	-- PlotService.GetPlotOwner(plot) already sees the new (ownerless) state.
+	firePlotReleased(plot, player)
 end
 
 local function handleClaimTouch(plot: Model, touchedPart: BasePart)
@@ -110,6 +142,11 @@ local function handleClaimTouch(plot: Model, touchedPart: BasePart)
 
 	state.ClaimLocked = false
 	playerClaimLocks[player] = nil
+
+	-- Fires after the claim is fully committed and the locks above are released, so listeners
+	-- observe a consistent state and can safely query this service without being rejected by a
+	-- lock that is still held.
+	firePlotClaimed(plot, player)
 end
 
 local function createClaimLabel(platform: Part): TextLabel
@@ -287,6 +324,51 @@ end
 function PlotService.IsPlotAvailable(plot: Model): boolean
 	local state = plotStates[plot]
 	return state ~= nil and state.Owner == nil and not state.ClaimLocked
+end
+
+-- Subscribes to claim notifications and returns the unsubscribe function.
+--
+-- Notifications are delivered synchronously, in subscription order, on the thread that
+-- changed the plot, and listeners must not yield: a claim/release is applied atomically and
+-- a yielding listener would let other Touched callbacks interleave with it. Building a
+-- structure out of Instances (what MiningService does here) never yields, so this is fine.
+--
+-- Subscribing or unsubscribing from inside a listener is not supported: the listener list is
+-- being iterated at that moment.
+function PlotService.OnPlotClaimed(listener: PlotClaimedListener): () -> ()
+	table.insert(plotClaimedListeners, listener)
+
+	local subscribed = true
+	return function()
+		if not subscribed then
+			return
+		end
+		subscribed = false
+
+		local index = table.find(plotClaimedListeners, listener)
+		if index ~= nil then
+			table.remove(plotClaimedListeners, index)
+		end
+	end
+end
+
+-- Same contract as OnPlotClaimed, for the moment a plot stops belonging to a player
+-- (including when that player leaves the game).
+function PlotService.OnPlotReleased(listener: PlotReleasedListener): () -> ()
+	table.insert(plotReleasedListeners, listener)
+
+	local subscribed = true
+	return function()
+		if not subscribed then
+			return
+		end
+		subscribed = false
+
+		local index = table.find(plotReleasedListeners, listener)
+		if index ~= nil then
+			table.remove(plotReleasedListeners, index)
+		end
+	end
 end
 
 return PlotService
